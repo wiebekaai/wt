@@ -750,30 +750,76 @@ test("wt add: new branch with --base branches from specified ref", () => {
   assert.ok(existsSync(expectedPath));
 });
 
-test("wt add: local branch + --base delegates to git without wrapper error", () => {
+test("wt add: --base with mixed conflicts lists all in one message, no worktrees created", () => {
   const { repo } = makeGitRepoWithOrigin();
   const home = mkdtempSync(join(tmpdir(), "wt-"));
   const wtBase = mkdtempSync(join(tmpdir(), "wt-base-"));
   writeFileSync(join(home, ".wt.json"), JSON.stringify({ path: wtBase }));
 
-  // local branch exists
+  spawnSync("git", ["-C", repo, "branch", "have-local"]);
+  spawnSync("git", ["-C", repo, "branch", "have-remote"]);
+  spawnSync("git", ["-C", repo, "push", "origin", "have-remote"]);
+  spawnSync("git", ["-C", repo, "branch", "-d", "have-remote"]);
+
+  const { status, stdout, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "add", "fresh", "have-local", "have-remote", "--base", "main"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.notEqual(status, 0);
+  const err = stderr.toString();
+  assert.match(err, /existing branches:/);
+  assert.match(err, /have-local \(local\)/);
+  assert.match(err, /have-remote \(origin\)/);
+  assert.equal(stdout.toString(), "");
+
+  // atomicity: no worktree directory should have been created for any branch
+  const repoName = repo.split("/").pop() ?? "";
+  assert.ok(!existsSync(join(wtBase, repoName, "fresh")));
+  assert.ok(!existsSync(join(wtBase, repoName, "have-local")));
+  assert.ok(!existsSync(join(wtBase, repoName, "have-remote")));
+});
+
+test("wt add: --base with remote-only branch errors with (origin) hint", () => {
+  const { repo } = makeGitRepoWithOrigin();
+  const home = mkdtempSync(join(tmpdir(), "wt-"));
+  const wtBase = mkdtempSync(join(tmpdir(), "wt-base-"));
+  writeFileSync(join(home, ".wt.json"), JSON.stringify({ path: wtBase }));
+
+  spawnSync("git", ["-C", repo, "branch", "remote-only"]);
+  spawnSync("git", ["-C", repo, "push", "origin", "remote-only"]);
+  spawnSync("git", ["-C", repo, "branch", "-d", "remote-only"]);
+
+  const { status, stdout, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "add", "remote-only", "--base", "main"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.notEqual(status, 0, "expected non-zero exit");
+  assert.match(stderr.toString(), /remote-only \(origin\)/);
+  assert.equal(stdout.toString(), "");
+});
+
+test("wt add: --base with existing local branch errors with (local) hint", () => {
+  const { repo } = makeGitRepoWithOrigin();
+  const home = mkdtempSync(join(tmpdir(), "wt-"));
+  const wtBase = mkdtempSync(join(tmpdir(), "wt-base-"));
+  writeFileSync(join(home, ".wt.json"), JSON.stringify({ path: wtBase }));
+
   spawnSync("git", ["-C", repo, "branch", "existing-local"]);
 
-  // --base is silently ignored for local branches; wt must not add its own error
-  const { status, stderr } = spawnSync(
+  const { status, stdout, stderr } = spawnSync(
     process.execPath,
     [SCRIPT, "add", "existing-local", "--base", "main"],
     { cwd: repo, env: { ...process.env, HOME: home } },
   );
 
-  // git will succeed (checking out existing-local, --base is ignored at wt level)
-  // the important check: no error about --base being unsupported
-  assert.ok(
-    !/✗.*base/i.test(stderr.toString()),
-    `unexpected wt error: ${stderr.toString()}`,
-  );
-  // and it should succeed
-  assert.equal(status, 0, `stderr: ${stderr.toString()}`);
+  assert.notEqual(status, 0, "expected non-zero exit");
+  assert.match(stderr.toString(), /existing-local \(local\)/);
+  assert.match(stderr.toString(), /--base/);
+  assert.equal(stdout.toString(), "", "no path should be printed on stdout");
 });
 
 // ── wt add postCreate (integration) ──────────────────────────────────────────

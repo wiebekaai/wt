@@ -800,6 +800,28 @@ async function cmdAdd(args) {
 
   const base = explicitBase ?? "HEAD";
 
+  // --base is meaningful only when creating a brand-new branch. Validate up
+  // front so we don't silently ignore it for branches that already exist
+  // locally or on origin (and so we don't half-create worktrees before failing).
+  if (explicitBase !== null) {
+    const conflicts =
+      /** @type {{ name: string, state: 'local' | 'remote' }[]} */ (
+        branches
+          .map((b) => ({ name: b, state: getBranchState(b) }))
+          .filter((c) => c.state !== "new")
+      );
+    if (conflicts.length > 0) {
+      const list = conflicts
+        .map((c) => `${c.name} (${c.state === "local" ? "local" : "origin"})`)
+        .join(", ");
+      const noun = conflicts.length === 1 ? "branch" : "branches";
+      fatal(
+        `--base cannot be used with existing ${noun}: ${list}`,
+        "Drop --base, or pick branch names that don't exist yet.",
+      );
+    }
+  }
+
   // Resolve dirty-tree dirtyAction before touching any worktrees
   /** @type {'move' | 'keep' | 'copy' | null} */
   let dirtyAction = moveFlag
