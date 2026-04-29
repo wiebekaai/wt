@@ -7,6 +7,7 @@ import {
   writeFileSync,
   mkdirSync,
   realpathSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname, isAbsolute } from "node:path";
@@ -1054,25 +1055,35 @@ async function cmdRm(args) {
     return;
   }
 
+  let failures = 0;
   for (const name of branches) {
     const wt = worktrees.find((w) => w.branch === name);
     if (!wt) {
-      fatal(`No worktree for branch: ${bold(name)}`);
+      error(`No worktree for branch: ${bold(name)}`);
+      failures++;
+      continue;
     }
 
     if (wt.path === mainPath) {
-      fatal("Cannot remove the main worktree");
+      error("Cannot remove the main worktree");
+      failures++;
+      continue;
     }
 
     if (!force && safeIsDirty(wt)) {
-      fatal(
+      error(
         `${bold(name)} has uncommitted changes`,
         "Pass --force to override.",
       );
+      failures++;
+      continue;
     }
 
-    rmWorktree(wt, force, safeDel, forceDel);
+    if (!rmWorktree(wt, force, safeDel, forceDel)) {
+      failures++;
+    }
   }
+  if (failures > 0) process.exit(1);
 }
 
 /**
@@ -1094,11 +1105,13 @@ function safeIsDirty(wt) {
 
 /**
  * Remove a linked worktree, emit a confirmation line on stderr, and optionally
- * delete its branch. Exits on git failure.
+ * delete its branch. Returns true on success, false on failure; the caller
+ * sets the process exit code based on the aggregate result.
  * @param {{ branch: string, path: string }} wt
  * @param {boolean} force
  * @param {boolean} safeDel
  * @param {boolean} forceDel
+ * @returns {boolean}
  */
 function rmWorktree(wt, force, safeDel, forceDel) {
   const removeArgs = ["worktree", "remove"];
@@ -1110,7 +1123,29 @@ function rmWorktree(wt, force, safeDel, forceDel) {
       stdio: ["ignore", "ignore", "inherit"],
     });
   } catch {
-    fatal(`Failed to remove ${bold(wt.branch)}`, wt.path, { code: 2 });
+    // With --force, fall back to nuking the directory and pruning git's admin
+    // state. Covers cases git won't handle even with --force (locked worktree,
+    // permissions, etc.) and the desync case where the dir is left behind
+    // after a partial removal.
+    if (force) {
+      try {
+        // Unlock first so prune isn't blocked by a leftover lock entry.
+        spawnSync("git", ["worktree", "unlock", wt.path], { stdio: "ignore" });
+        rmSync(wt.path, { recursive: true, force: true });
+        execFileSync("git", ["worktree", "prune"], {
+          stdio: ["ignore", "ignore", "inherit"],
+        });
+      } catch {
+        error(`Failed to remove ${bold(wt.branch)}`, wt.path);
+        return false;
+      }
+    } else {
+      error(
+        `Failed to remove ${bold(wt.branch)}`,
+        `${wt.path}\nPass --force to remove anyway.`,
+      );
+      return false;
+    }
   }
 
   if (safeDel || forceDel) {
@@ -1120,13 +1155,14 @@ function rmWorktree(wt, force, safeDel, forceDel) {
         stdio: ["ignore", "ignore", "inherit"],
       });
       success(`Removed ${bold(wt.branch)} and deleted branch`);
+      return true;
     } catch {
       success(`Removed ${bold(wt.branch)}`);
-      process.exit(2);
+      return false;
     }
-  } else {
-    success(`Removed ${bold(wt.branch)}`);
   }
+  success(`Removed ${bold(wt.branch)}`);
+  return true;
 }
 
 /**

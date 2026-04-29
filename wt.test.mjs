@@ -1747,6 +1747,80 @@ test("wt remove: dirty worktree exits 1 and leaves worktree intact", () => {
   assert.ok(existsSync(wtPath), "worktree should still exist");
 });
 
+test("wt remove --force: removes worktree with gitignored leftover files", () => {
+  const { repo, wtPath, home } = makeRepoWithLinkedWorktree();
+
+  // .gitignore makes the leftover untracked-but-not-dirty (mimics node_modules)
+  writeFileSync(join(wtPath, ".gitignore"), "leftover/\n");
+  spawnSync("git", ["-C", wtPath, "add", ".gitignore"]);
+  spawnSync("git", ["-C", wtPath, "commit", "-m", "ignore leftover"]);
+  mkdirSync(join(wtPath, "leftover"));
+  writeFileSync(join(wtPath, "leftover", "stuff.txt"), "x");
+
+  const { status, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "remove", "--force", "feat/rm-test"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.equal(status, 0, `stderr: ${stderr.toString()}`);
+  assert.ok(!existsSync(wtPath), "worktree dir should be gone");
+
+  const { stdout: porcelain } = spawnSync(
+    "git",
+    ["-C", repo, "worktree", "list", "--porcelain"],
+    { encoding: "utf8" },
+  );
+  assert.ok(
+    !porcelain.includes(wtPath),
+    "git should no longer track the worktree",
+  );
+});
+
+test("wt remove: failure without --force suggests --force in error", () => {
+  const { repo, wtPath, home } = makeRepoWithLinkedWorktree();
+
+  // Lock the worktree so `git worktree remove` fails for a non-dirty reason
+  // (this exercises the failure path in rmWorktree, not the dirty pre-check).
+  spawnSync("git", ["-C", repo, "worktree", "lock", wtPath]);
+
+  const { status, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "remove", "feat/rm-test"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.notEqual(status, 0);
+  assert.match(stderr.toString(), /Pass --force/i);
+});
+
+test("wt remove --force: falls back to rm -rf + prune when git worktree remove fails", () => {
+  const { repo, wtPath, home } = makeRepoWithLinkedWorktree();
+
+  // Lock the worktree — `git worktree remove --force` refuses a locked tree
+  // with a single --force, so this exercises the fallback path.
+  spawnSync("git", ["-C", repo, "worktree", "lock", wtPath]);
+
+  const { status, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "remove", "--force", "feat/rm-test"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.equal(status, 0, `stderr: ${stderr.toString()}`);
+  assert.ok(!existsSync(wtPath), "worktree dir should be gone");
+
+  const { stdout: porcelain } = spawnSync(
+    "git",
+    ["-C", repo, "worktree", "list", "--porcelain"],
+    { encoding: "utf8" },
+  );
+  assert.ok(
+    !porcelain.includes(wtPath),
+    "git's worktree admin entry should be pruned",
+  );
+});
+
 test("wt remove --force: dirty worktree is removed", () => {
   const { repo, wtPath, home } = makeRepoWithLinkedWorktree({ dirty: true });
 
@@ -1901,7 +1975,30 @@ test("wt remove: multi-target removes all when all clean", () => {
   }
 });
 
-test("wt remove: multi-target stops on failure, keeps prior removals", () => {
+test("wt remove: missing branch in batch warns and removes the rest", () => {
+  const { repo } = makeGitRepo();
+  const home = mkdtempSync(join(tmpdir(), "wt-"));
+  const wtBase = mkdtempSync(join(tmpdir(), "wt-base-"));
+  writeFileSync(join(home, ".wt.json"), JSON.stringify({ path: wtBase }));
+
+  const repoName = repo.split("/").pop() ?? "";
+  const realPath = join(wtBase, repoName, "feat-real");
+  mkdirSync(dirname(realPath), { recursive: true });
+  spawnSync("git", ["-C", repo, "branch", "feat-real"]);
+  spawnSync("git", ["-C", repo, "worktree", "add", realPath, "feat-real"]);
+
+  const { status, stderr } = spawnSync(
+    process.execPath,
+    [SCRIPT, "remove", "feat-missing", "feat-real"],
+    { cwd: repo, env: { ...process.env, HOME: home } },
+  );
+
+  assert.notEqual(status, 0, "should exit non-zero because of missing branch");
+  assert.ok(!existsSync(realPath), "feat-real should be removed");
+  assert.match(stderr.toString(), /No worktree for branch:.*feat-missing/);
+});
+
+test("wt remove: multi-target continues past failure, removes the rest", () => {
   const { repo } = makeGitRepo();
   const home = mkdtempSync(join(tmpdir(), "wt-"));
   const wtBase = mkdtempSync(join(tmpdir(), "wt-base-"));
@@ -1922,7 +2019,7 @@ test("wt remove: multi-target stops on failure, keeps prior removals", () => {
   spawnSync("git", ["-C", repo, "worktree", "add", dirtyPath, "feat-dirty"]);
   writeFileSync(join(dirtyPath, "dirty.txt"), "change");
 
-  // feat-third: clean (should not be attempted)
+  // feat-third: clean (should still be attempted)
   const thirdPath = join(wtBase, repoName, "feat-third");
   mkdirSync(dirname(thirdPath), { recursive: true });
   spawnSync("git", ["-C", repo, "branch", "feat-third"]);
@@ -1935,15 +2032,12 @@ test("wt remove: multi-target stops on failure, keeps prior removals", () => {
   );
 
   assert.notEqual(status, 0, "should exit non-zero on failure");
-  assert.ok(
-    !existsSync(firstPath),
-    "feat-first was already removed before failure",
-  );
+  assert.ok(!existsSync(firstPath), "feat-first should be removed");
   assert.ok(
     existsSync(dirtyPath),
     "feat-dirty should still exist (removal failed)",
   );
-  assert.ok(existsSync(thirdPath), "feat-third should not have been attempted");
+  assert.ok(!existsSync(thirdPath), "feat-third should be removed");
 });
 
 // ── issue-14: drop slug from UX ───────────────────────────────────────────────
